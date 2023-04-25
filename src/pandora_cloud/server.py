@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
-
+import json
 import logging
-from datetime import datetime
-from os import getenv
+import traceback
 from os.path import join, abspath, dirname
 
 from flask import Flask, jsonify, request, render_template, redirect, url_for, make_response
@@ -13,21 +12,21 @@ from waitress import serve
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.serving import WSGIRequestHandler
 
-from . import __version__
-
 
 class ChatBot:
-    __default_ip = '127.0.0.1'
+    __default_ip = '0.0.0.0'
     __default_port = 8018
     __build_id = 'tTShkecJDS0nIc9faO2vC'
 
-    def __init__(self, proxy, debug=False, sentry=False, login_local=False):
+    def __init__(self, proxy, debug=False, sentry=False, login_local=False, pwd='', token_file=None):
         self.proxy = proxy
         self.debug = debug
         self.sentry = sentry
         self.login_local = login_local
+        self.pwd = pwd
+        self.token_file = token_file
         self.log_level = logging.DEBUG if debug else logging.WARN
-        self.api_prefix = getenv('CHATGPT_API_PREFIX', 'https://ai.fakeopen.com')
+        self.api_prefix = 'https://chat-api.zhile.io'
 
         hook_logging(level=self.log_level, format='[%(asctime)s] %(levelname)s in %(module)s: %(message)s')
         self.logger = logging.getLogger('waitress')
@@ -63,6 +62,7 @@ class ChatBot:
 
     @staticmethod
     def __after_request(resp):
+        __version__ = '0.07'
         resp.headers['X-Server'] = 'pandora-cloud/{}'.format(__version__)
 
         return resp
@@ -82,16 +82,12 @@ class ChatBot:
     def __set_cookie(resp, token, expires):
         resp.set_cookie('access-token', token, expires=expires, path='/', domain=None, httponly=True, samesite='Lax')
 
-    @staticmethod
-    def __get_userinfo():
-        access_token = request.cookies.get('access-token')
-        try:
-            payload = check_access_token(access_token)
-        except:
-            return True, None, None, None, None
+    def __get_userinfo(self):
+        payload = self.load_token_file()
 
-        user_id = payload['https://api.openai.com/auth']['user_id']
-        email = payload['https://api.openai.com/profile']['email']
+        user_id = payload.get("user").get('id')
+        email = payload.get("user").get('email')
+        access_token = payload.get("accessToken")
 
         return False, user_id, email, access_token, payload
 
@@ -130,16 +126,18 @@ class ChatBot:
 
         if access_token:
             try:
-                payload = check_access_token(access_token)
+                if access_token == self.pwd:
+                    payload = self.load_token_file()
 
-                resp = jsonify({'code': 0, 'url': url_for('chat')})
-                self.__set_cookie(resp, access_token, payload['exp'])
+                    resp = jsonify({'code': 0, 'url': url_for('chat')})
+                    self.__set_cookie(resp, payload.get('accessToken'), payload.get('expires'))
 
-                return resp
+                    return resp
             except Exception as e:
                 error = str(e)
+                print(traceback.format_exc())
 
-        return jsonify({'code': 500, 'message': 'Invalid access token: {}'.format(error)})
+        return jsonify({'code': 500, 'message': 'Invalid password: {}'.format(error)})
 
     def chat(self, conversation_id=None):
         err, user_id, email, _, _ = self.__get_userinfo()
@@ -192,7 +190,7 @@ class ChatBot:
                 'picture': None,
                 'groups': []
             },
-            'expires': datetime.utcfromtimestamp(payload['exp']).isoformat(),
+            'expires': payload.get("expires"),
             'accessToken': access_token
         }
 
@@ -250,3 +248,12 @@ class ChatBot:
         }
 
         return jsonify(ret)
+
+    def load_token_file(self):
+        """
+        Load data from json file in temp path.
+        """
+        if self.token_file:
+            with open(self.token_file, mode="r", encoding="UTF-8") as f:
+                data = json.load(f)
+            return data
