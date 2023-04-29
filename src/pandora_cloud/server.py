@@ -4,9 +4,10 @@ import logging
 import traceback
 from os.path import join, abspath, dirname
 
-from flask import Flask, jsonify, request, render_template, redirect, url_for, make_response
+from flask import Flask, jsonify, request, render_template, redirect, url_for, make_response, Response
 from pandora.exts.hooks import hook_logging
 from pandora.exts.token import check_access_token
+from pandora.openai.api import API, ChatGPT
 from pandora.openai.auth import Auth0
 from waitress import serve
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -26,7 +27,8 @@ class ChatBot:
         self.pwd = pwd
         self.token_file = token_file
         self.log_level = logging.DEBUG if debug else logging.WARN
-        self.api_prefix = 'https://chat-api.zhile.io'
+        self.api_prefix = 'http://chat.jclass24.com'
+        self.chatgpt = ChatGPT(self.load_token_file())
 
         hook_logging(level=self.log_level, format='[%(asctime)s] %(levelname)s in %(module)s: %(message)s')
         self.logger = logging.getLogger('waitress')
@@ -40,6 +42,17 @@ class ChatBot:
                     template_folder=join(resource_path, 'templates'))
         app.wsgi_app = ProxyFix(app.wsgi_app, x_port=1)
         app.after_request(self.__after_request)
+
+        app.route('/api/models')(self.list_models)
+        app.route('/api/conversations')(self.list_conversations)
+        app.route('/api/conversations', methods=['DELETE'])(self.clear_conversations)
+        app.route('/api/conversation/<conversation_id>')(self.get_conversation)
+        app.route('/api/conversation/<conversation_id>', methods=['DELETE'])(self.del_conversation)
+        app.route('/api/conversation/<conversation_id>', methods=['PATCH'])(self.set_conversation_title)
+        app.route('/api/conversation/gen_title/<conversation_id>', methods=['POST'])(self.gen_conversation_title)
+        app.route('/api/conversation/talk', methods=['POST'])(self.talk)
+        app.route('/api/conversation/regenerate', methods=['POST'])(self.regenerate)
+        app.route('/api/conversation/goon', methods=['POST'])(self.goon)
 
         app.route('/api/auth/session')(self.session)
         app.route('/api/accounts/check')(self.check)
@@ -84,12 +97,14 @@ class ChatBot:
 
     def __get_userinfo(self):
         payload = self.load_token_file()
-
-        user_id = payload.get("user").get('id')
-        email = payload.get("user").get('email')
-        access_token = payload.get("accessToken")
-
-        return False, user_id, email, access_token, payload
+        access_token = request.cookies.get('access-token')
+        if payload.get("accessToken") == access_token:
+            user_id = payload.get("user").get('id')
+            email = payload.get("user").get('email')
+            access_token = payload.get("accessToken")
+            return False, user_id, email, access_token, payload
+        else:
+            return True, None, None, None, None
 
     def logout(self):
         resp = jsonify({'url': url_for('login')})
@@ -257,3 +272,98 @@ class ChatBot:
             with open(self.token_file, mode="r", encoding="UTF-8") as f:
                 data = json.load(f)
             return data
+
+    def list_models(self):
+        return self.__proxy_result(self.chatgpt.list_models(True, self.__get_token_key()))
+
+    def list_conversations(self):
+        offset = request.args.get('offset', '1')
+        limit = request.args.get('limit', '20')
+
+        return self.__proxy_result(self.chatgpt.list_conversations(offset, limit, True, self.__get_token_key()))
+
+    def get_conversation(self, conversation_id):
+        return self.__proxy_result(self.chatgpt.get_conversation(conversation_id, True, self.__get_token_key()))
+
+    def del_conversation(self, conversation_id):
+        return self.__proxy_result(self.chatgpt.del_conversation(conversation_id, True, self.__get_token_key()))
+
+    def clear_conversations(self):
+        return self.__proxy_result(self.chatgpt.clear_conversations(True, self.__get_token_key()))
+
+    def set_conversation_title(self, conversation_id):
+        title = request.json['title']
+
+        return self.__proxy_result(
+            self.chatgpt.set_conversation_title(conversation_id, title, True, self.__get_token_key()))
+
+    def gen_conversation_title(self, conversation_id):
+        payload = request.json
+        model = payload['model']
+        message_id = payload['message_id']
+
+        return self.__proxy_result(
+            self.chatgpt.gen_conversation_title(conversation_id, model, message_id, True, self.__get_token_key()))
+
+    def talk(self):
+        payload = request.json
+        prompt = payload['prompt']
+        model = payload['model']
+        message_id = payload['message_id']
+        parent_message_id = payload['parent_message_id']
+        conversation_id = payload.get('conversation_id')
+        stream = payload.get('stream', True)
+
+        return self.__process_stream(
+            *self.chatgpt.talk(prompt, model, message_id, parent_message_id, conversation_id, stream,
+                               self.__get_token_key()), stream)
+
+    def goon(self):
+        payload = request.json
+        model = payload['model']
+        parent_message_id = payload['parent_message_id']
+        conversation_id = payload.get('conversation_id')
+        stream = payload.get('stream', True)
+
+        return self.__process_stream(
+            *self.chatgpt.goon(model, parent_message_id, conversation_id, stream, self.__get_token_key()), stream)
+
+    def regenerate(self):
+        payload = request.json
+
+        conversation_id = payload.get('conversation_id')
+        if not conversation_id:
+            return self.talk()
+
+        prompt = payload['prompt']
+        model = payload['model']
+        message_id = payload['message_id']
+        parent_message_id = payload['parent_message_id']
+        stream = payload.get('stream', True)
+
+        return self.__process_stream(
+            *self.chatgpt.regenerate_reply(prompt, model, conversation_id, message_id, parent_message_id, stream,
+                                           self.__get_token_key()), stream)
+
+    @staticmethod
+    def __process_stream(status, headers, generator, stream):
+        if stream:
+            return Response(API.wrap_stream_out(generator, status), mimetype=headers['Content-Type'], status=status)
+
+        last_json = None
+        for json in generator:
+            last_json = json
+
+        return make_response(last_json, status)
+
+    @staticmethod
+    def __proxy_result(remote_resp):
+        resp = make_response(remote_resp.text)
+        resp.content_type = remote_resp.headers['Content-Type']
+        resp.status_code = remote_resp.status_code
+
+        return resp
+
+    @staticmethod
+    def __get_token_key():
+        return "accessToken"
