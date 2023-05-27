@@ -4,14 +4,14 @@ import logging
 import traceback
 from os.path import join, abspath, dirname
 
-from flask import Flask, jsonify, request, render_template, redirect, url_for, make_response, Response
 from pandora.exts.hooks import hook_logging
 from pandora.exts.token import check_access_token
-from pandora.openai.api import API, ChatGPT
 from pandora.openai.auth import Auth0
 from waitress import serve
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.serving import WSGIRequestHandler
+
+from flask import Flask, jsonify, request, render_template, redirect, url_for, make_response
 
 
 class ChatBot:
@@ -27,8 +27,7 @@ class ChatBot:
         self.pwd = pwd
         self.token_file = token_file
         self.log_level = logging.DEBUG if debug else logging.WARN
-        self.api_prefix = 'http://chat.jclass24.com'
-        self.chatgpt = ChatGPT(self.load_token_file())
+        self.api_prefix = 'https://ai.zanzan.eu.org/'
 
         hook_logging(level=self.log_level, format='[%(asctime)s] %(levelname)s in %(module)s: %(message)s')
         self.logger = logging.getLogger('waitress')
@@ -43,29 +42,22 @@ class ChatBot:
         app.wsgi_app = ProxyFix(app.wsgi_app, x_port=1)
         app.after_request(self.__after_request)
 
-        app.route('/api/models')(self.list_models)
-        app.route('/api/conversations')(self.list_conversations)
-        app.route('/api/conversations', methods=['DELETE'])(self.clear_conversations)
-        app.route('/api/conversation/<conversation_id>')(self.get_conversation)
-        app.route('/api/conversation/<conversation_id>', methods=['DELETE'])(self.del_conversation)
-        app.route('/api/conversation/<conversation_id>', methods=['PATCH'])(self.set_conversation_title)
-        app.route('/api/conversation/gen_title/<conversation_id>', methods=['POST'])(self.gen_conversation_title)
-        app.route('/api/conversation/talk', methods=['POST'])(self.talk)
-        app.route('/api/conversation/regenerate', methods=['POST'])(self.regenerate)
-        app.route('/api/conversation/goon', methods=['POST'])(self.goon)
-
         app.route('/api/auth/session')(self.session)
-        app.route('/api/accounts/check')(self.check)
-        app.route('/api/auth/signout', methods=['POST'])(self.logout)
-        app.route('/_next/data/{}/chat.json'.format(self.__build_id))(self.chat_info)
+        app.route('/api/accounts/check/v4-2023-04-27')(self.check)
+        app.route('/auth/logout')(self.logout)
+        app.route('/_next/data/{}/index.json'.format(self.__build_id))(self.chat_info)
+        app.route('/_next/data/{}/c/<conversation_id>.json'.format(self.__build_id))(self.chat_info)
 
         app.route('/')(self.chat)
-        app.route('/chat')(self.chat)
-        app.route('/chat/<conversation_id>')(self.chat)
+        app.route('/c')(self.chat)
+        app.route('/c/<conversation_id>')(self.chat)
 
-        app.route('/login')(self.login)
-        app.route('/login', methods=['POST'])(self.login_post)
-        app.route('/login_token', methods=['POST'])(self.login_token)
+        app.route('/chat')(self.chat_index)
+        app.route('/chat/<conversation_id>')(self.chat_index)
+
+        app.route('/auth/login')(self.login)
+        app.route('/auth/login', methods=['POST'])(self.login_post)
+        app.route('/auth/login_token', methods=['POST'])(self.login_token)
 
         if not self.debug:
             self.logger.warning('Serving on http://{}:{}'.format(host, port))
@@ -106,8 +98,14 @@ class ChatBot:
         else:
             return True, None, None, None, None
 
+    @staticmethod
+    def chat_index(conversation_id=None):
+        resp = redirect('/')
+
+        return resp
+
     def logout(self):
-        resp = jsonify({'url': url_for('login')})
+        resp = redirect(url_for('login'))
         self.__set_cookie(resp, '', 0)
 
         return resp
@@ -126,7 +124,7 @@ class ChatBot:
                 payload = check_access_token(access_token)
 
                 resp = make_response('please wait...', 302)
-                resp.headers.set('Location', url_for('chat'))
+                resp.headers.set('Location', '/')
                 self.__set_cookie(resp, access_token, payload['exp'])
 
                 return resp
@@ -144,7 +142,7 @@ class ChatBot:
                 if access_token == self.pwd:
                     payload = self.load_token_file()
 
-                    resp = jsonify({'code': 0, 'url': url_for('chat')})
+                    resp = jsonify({'code': 0, 'url': '/'})
                     self.__set_cookie(resp, payload.get('accessToken'), payload.get('expires'))
 
                     return resp
@@ -159,6 +157,10 @@ class ChatBot:
         if err:
             return redirect(url_for('login'))
 
+        query = request.args.to_dict()
+        if conversation_id:
+            query['chatId'] = conversation_id
+
         props = {
             'props': {
                 'pageProps': {
@@ -168,7 +170,7 @@ class ChatBot:
                         'email': email,
                         'image': None,
                         'picture': None,
-                        'groups': []
+                        'groups': [],
                     },
                     'serviceStatus': {},
                     'userCountry': 'US',
@@ -181,15 +183,16 @@ class ChatBot:
                 },
                 '__N_SSP': True
             },
-            'page': '/chat/[[...chatId]]',
-            'query': {'chatId': [conversation_id]} if conversation_id else {},
+            'page': '/c/[chatId]' if conversation_id else '/',
+            'query': query,
             'buildId': self.__build_id,
             'isFallback': False,
             'gssp': True,
             'scriptLoader': []
         }
 
-        return render_template('chat.html', pandora_sentry=self.sentry, api_prefix=self.api_prefix, props=props)
+        template = 'detail.html' if conversation_id else 'chat.html'
+        return render_template(template, pandora_sentry=self.sentry, api_prefix=self.api_prefix, props=props)
 
     def session(self):
         err, user_id, email, access_token, payload = self.__get_userinfo()
@@ -203,18 +206,19 @@ class ChatBot:
                 'email': email,
                 'image': None,
                 'picture': None,
-                'groups': []
+                'groups': [],
             },
             'expires': payload.get("expires"),
-            'accessToken': access_token
+            'accessToken': access_token,
+            'authProvider': 'auth0',
         }
 
         return jsonify(ret)
 
-    def chat_info(self):
+    def chat_info(self, conversation_id=None):
         err, user_id, email, _, _ = self.__get_userinfo()
         if err:
-            return jsonify({'pageProps': {'__N_REDIRECT': '/login', '__N_REDIRECT_STATUS': 307}, '__N_SSP': True})
+            return jsonify({'pageProps': {'__N_REDIRECT': '/auth/login?', '__N_REDIRECT_STATUS': 307}, '__N_SSP': True})
 
         ret = {
             'pageProps': {
@@ -224,7 +228,7 @@ class ChatBot:
                     'email': email,
                     'image': None,
                     'picture': None,
-                    'groups': []
+                    'groups': [],
                 },
                 'serviceStatus': {},
                 'userCountry': 'US',
@@ -243,23 +247,60 @@ class ChatBot:
     @staticmethod
     def check():
         ret = {
-            'account_plan': {
-                'is_paid_subscription_active': True,
-                'subscription_plan': 'chatgptplusplan',
-                'account_user_role': 'account-owner',
-                'was_paid_customer': True,
-                'has_customer_object': True,
-                'subscription_expires_at_timestamp': 3774355199
+            'accounts': {
+                'default': {
+                    'account': {
+                        'account_user_role': 'account-owner',
+                        'account_user_id': 'd0322341-7ace-4484-b3f7-89b03e82b927',
+                        'processor': {
+                            'a001': {
+                                'has_customer_object': True
+                            },
+                            'b001': {
+                                'has_transaction_history': True
+                            }
+                        },
+                        'account_id': 'a323bd05-db25-4e8f-9173-2f0c228cc8fa',
+                        'is_most_recent_expired_subscription_gratis': True,
+                        'has_previously_paid_subscription': True
+                    },
+                    'features': [
+                        'model_switcher',
+                        'model_preview',
+                        'system_message',
+                        'data_controls_enabled',
+                        'data_export_enabled',
+                        'show_existing_user_age_confirmation_modal',
+                        'bucketed_history',
+                        'priority_driven_models_list',
+                        'message_style_202305',
+                        'layout_may_2023',
+                        'plugins_available',
+                        'beta_features',
+                        'infinite_scroll_history',
+                        'browsing_available',
+                        'browsing_inner_monologue',
+                        'browsing_bing_branding',
+                        'shareable_links',
+                        'plugin_display_params',
+                        'tools3_dev',
+                        'tools2',
+                        'debug',
+                    ],
+                    'entitlement': {
+                        'subscription_id': 'd0dcb1fc-56aa-4cd9-90ef-37f1e03576d3',
+                        'has_active_subscription': True,
+                        'subscription_plan': 'chatgptplusplan',
+                        'expires_at': '2089-08-08T23:59:59+00:00'
+                    },
+                    'last_active_subscription': {
+                        'subscription_id': 'd0dcb1fc-56aa-4cd9-90ef-37f1e03576d3',
+                        'purchase_origin_platform': 'chatgpt_mobile_ios',
+                        'will_renew': True
+                    }
+                }
             },
-            'user_country': 'US',
-            'features': [
-                'model_switcher',
-                'dfw_message_feedback',
-                'dfw_inline_message_regen_comparison',
-                'model_preview',
-                'system_message',
-                'can_continue',
-            ],
+            'temp_ap_available_at': '2023-05-20T17:30:00+00:00'
         }
 
         return jsonify(ret)
@@ -272,98 +313,3 @@ class ChatBot:
             with open(self.token_file, mode="r", encoding="UTF-8") as f:
                 data = json.load(f)
             return data
-
-    def list_models(self):
-        return self.__proxy_result(self.chatgpt.list_models(True, self.__get_token_key()))
-
-    def list_conversations(self):
-        offset = request.args.get('offset', '1')
-        limit = request.args.get('limit', '20')
-
-        return self.__proxy_result(self.chatgpt.list_conversations(offset, limit, True, self.__get_token_key()))
-
-    def get_conversation(self, conversation_id):
-        return self.__proxy_result(self.chatgpt.get_conversation(conversation_id, True, self.__get_token_key()))
-
-    def del_conversation(self, conversation_id):
-        return self.__proxy_result(self.chatgpt.del_conversation(conversation_id, True, self.__get_token_key()))
-
-    def clear_conversations(self):
-        return self.__proxy_result(self.chatgpt.clear_conversations(True, self.__get_token_key()))
-
-    def set_conversation_title(self, conversation_id):
-        title = request.json['title']
-
-        return self.__proxy_result(
-            self.chatgpt.set_conversation_title(conversation_id, title, True, self.__get_token_key()))
-
-    def gen_conversation_title(self, conversation_id):
-        payload = request.json
-        model = payload['model']
-        message_id = payload['message_id']
-
-        return self.__proxy_result(
-            self.chatgpt.gen_conversation_title(conversation_id, model, message_id, True, self.__get_token_key()))
-
-    def talk(self):
-        payload = request.json
-        prompt = payload['prompt']
-        model = payload['model']
-        message_id = payload['message_id']
-        parent_message_id = payload['parent_message_id']
-        conversation_id = payload.get('conversation_id')
-        stream = payload.get('stream', True)
-
-        return self.__process_stream(
-            *self.chatgpt.talk(prompt, model, message_id, parent_message_id, conversation_id, stream,
-                               self.__get_token_key()), stream)
-
-    def goon(self):
-        payload = request.json
-        model = payload['model']
-        parent_message_id = payload['parent_message_id']
-        conversation_id = payload.get('conversation_id')
-        stream = payload.get('stream', True)
-
-        return self.__process_stream(
-            *self.chatgpt.goon(model, parent_message_id, conversation_id, stream, self.__get_token_key()), stream)
-
-    def regenerate(self):
-        payload = request.json
-
-        conversation_id = payload.get('conversation_id')
-        if not conversation_id:
-            return self.talk()
-
-        prompt = payload['prompt']
-        model = payload['model']
-        message_id = payload['message_id']
-        parent_message_id = payload['parent_message_id']
-        stream = payload.get('stream', True)
-
-        return self.__process_stream(
-            *self.chatgpt.regenerate_reply(prompt, model, conversation_id, message_id, parent_message_id, stream,
-                                           self.__get_token_key()), stream)
-
-    @staticmethod
-    def __process_stream(status, headers, generator, stream):
-        if stream:
-            return Response(API.wrap_stream_out(generator, status), mimetype=headers['Content-Type'], status=status)
-
-        last_json = None
-        for json in generator:
-            last_json = json
-
-        return make_response(last_json, status)
-
-    @staticmethod
-    def __proxy_result(remote_resp):
-        resp = make_response(remote_resp.text)
-        resp.content_type = remote_resp.headers['Content-Type']
-        resp.status_code = remote_resp.status_code
-
-        return resp
-
-    @staticmethod
-    def __get_token_key():
-        return "accessToken"
